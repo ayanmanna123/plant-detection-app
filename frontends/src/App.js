@@ -20,7 +20,7 @@ function App() {
 
   const fetchDetectionHistory = async () => {
     try {
-      const response = await axios.get("http://localhost:5000/api/detections");
+      const response = await axios.get("https://plant-detection-app.vercel.app/api/detections");
       setDetectionHistory(response.data);
     } catch (err) {
       console.error("Error fetching history:", err);
@@ -60,7 +60,7 @@ function App() {
       formData.append("image", selectedFile);
 
       const response = await axios.post(
-        "http://localhost:5000/api/detect-plant",
+        "https://plant-detection-app.vercel.app/api/detect-plant",
         formData,
         {
           headers: {
@@ -85,7 +85,7 @@ function App() {
   const viewDetection = async (id) => {
     try {
       const response = await axios.get(
-        `http://localhost:5000/api/detections/${id}`
+        `https://plant-detection-app.vercel.app/api/detections/${id}`
       );
       setSelectedDetection(response.data);
       setCurrentView("details");
@@ -202,7 +202,7 @@ function App() {
                   <div className="plant-image-container">
                     {detection.imageUrl && (
                       <img
-                        src={`http://localhost:5000${detection.imageUrl}`}
+                        src={`https://plant-detection-app.vercel.app${detection.imageUrl}`}
                         alt={detection.commonName || "Plant"}
                         className="card-img-top plant-thumbnail"
                       />
@@ -253,7 +253,7 @@ function App() {
             <div className="col-md-4 mb-4">
               {selectedDetection.imageUrl && (
                 <img
-                  src={`http://localhost:5000${selectedDetection.imageUrl}`}
+                  src={`https://plant-detection-app.vercel.app${selectedDetection.imageUrl}`}
                   alt={selectedDetection.commonName || "Plant"}
                   className="img-fluid rounded"
                 />
