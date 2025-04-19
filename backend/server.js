@@ -2,8 +2,6 @@ const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
 const axios = require('axios');
-const fs = require('fs');
-const path = require('path');
 const mongoose = require('mongoose');
 require('dotenv').config();
 
@@ -18,8 +16,8 @@ mongoose.connect(process.env.MONGODB_URI)
 // Define Plant Detection Schema
 const plantDetectionSchema = new mongoose.Schema({
   originalImageName: String,
-  imagePath: String,
   imageData: String, // Base64 encoded image
+  mimeType: String,  // Store the image mime type
   detectedAt: { type: Date, default: Date.now },
   plantInfo: String,
   scientificName: String,
@@ -33,24 +31,8 @@ app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 app.use(express.static('public'));
 
-// Ensure public directory exists for serving images
-if (!fs.existsSync('public')) {
-  fs.mkdirSync('public');
-}
-if (!fs.existsSync('public/uploads')) {
-  fs.mkdirSync('public/uploads');
-}
-
-// Configure multer for file uploads
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, 'public/uploads/');
-  },
-  filename: (req, file, cb) => {
-    const uniqueFilename = `${Date.now()}-${Math.round(Math.random() * 1E9)}${path.extname(file.originalname)}`;
-    cb(null, uniqueFilename);
-  }
-});
+// Configure multer for memory storage (not disk storage)
+const storage = multer.memoryStorage();
 
 const upload = multer({ 
   storage: storage,
@@ -62,12 +44,6 @@ const upload = multer({
     cb(null, true);
   }
 });
-
-// Function to convert image to base64
-async function fileToBase64(filePath) {
-  const fileBuffer = await fs.promises.readFile(filePath);
-  return fileBuffer.toString('base64');
-}
 
 // Function to extract key information from plant data
 function extractPlantData(text) {
@@ -95,13 +71,11 @@ app.post('/api/detect-plant', upload.single('image'), async (req, res) => {
       return res.status(400).json({ error: 'No image file uploaded' });
     }
 
-    const imagePath = req.file.path;
-    const mimeType = req.file.mimetype;
     const originalImageName = req.file.originalname;
-    const imageUrl = `${req.protocol}://${req.get('host')}/${imagePath}`;
+    const mimeType = req.file.mimetype;
     
-    // Convert image to base64 for Gemini API
-    const imageBase64 = await fileToBase64(imagePath);
+    // Convert buffer to base64
+    const imageBase64 = req.file.buffer.toString('base64');
     
     // Prepare payload for Gemini API
     const payload = {
@@ -159,11 +133,11 @@ app.post('/api/detect-plant', upload.single('image'), async (req, res) => {
     // Extract key plant information
     const { scientificName, commonName } = extractPlantData(plantInfo);
 
-    // Save to MongoDB with relative image path
+    // Save to MongoDB
     const plantDetection = new PlantDetection({
       originalImageName,
-      imagePath: req.file.path,
       imageData: `data:${mimeType};base64,${imageBase64}`, // Store base64 image data
+      mimeType,
       plantInfo,
       scientificName,
       commonName
@@ -176,7 +150,7 @@ app.post('/api/detect-plant', upload.single('image'), async (req, res) => {
       id: plantDetection._id,
       scientificName,
       commonName,
-      imageUrl
+      imageUrl: `/api/images/${plantDetection._id}` // URL to access the image via API
     });
   } catch (error) {
     console.error('Error detecting plant:', error.response?.data || error.message);
@@ -186,14 +160,49 @@ app.post('/api/detect-plant', upload.single('image'), async (req, res) => {
   }
 });
 
+// Endpoint to serve images from MongoDB
+app.get('/api/images/:id', async (req, res) => {
+  try {
+    const plantDetection = await PlantDetection.findById(req.params.id);
+    if (!plantDetection || !plantDetection.imageData) {
+      return res.status(404).json({ error: 'Image not found' });
+    }
+
+    // Extract the base64 data and mime type
+    const imageDataParts = plantDetection.imageData.split(',');
+    const mimeType = plantDetection.mimeType || 'image/jpeg'; // Default to jpeg if missing
+    
+    // Send the image with appropriate content type
+    res.writeHead(200, {
+      'Content-Type': mimeType,
+      'Cache-Control': 'max-age=86400'
+    });
+    
+    // If data is in format "data:image/jpeg;base64,ACTUAL_DATA"
+    const base64Data = imageDataParts.length > 1 ? imageDataParts[1] : imageDataParts[0];
+    const imageBuffer = Buffer.from(base64Data, 'base64');
+    res.end(imageBuffer);
+  } catch (error) {
+    console.error('Error serving image:', error);
+    res.status(500).json({ error: 'Failed to serve image' });
+  }
+});
+
 // Get all plant detections
 app.get('/api/detections', async (req, res) => {
   try {
     const detections = await PlantDetection.find()
       .sort({ detectedAt: -1 })
-      .select('originalImageName detectedAt scientificName commonName imageData _id');
+      .select('originalImageName detectedAt scientificName commonName _id');
     
-    res.json(detections);
+    // Add image URLs to each detection
+    const detectionsWithUrls = detections.map(detection => {
+      const item = detection.toObject();
+      item.imageUrl = `/api/images/${detection._id}`;
+      return item;
+    });
+    
+    res.json(detectionsWithUrls);
   } catch (error) {
     console.error('Error fetching detections:', error);
     res.status(500).json({ error: 'Failed to fetch plant detections' });
@@ -207,7 +216,13 @@ app.get('/api/detections/:id', async (req, res) => {
     if (!detection) {
       return res.status(404).json({ error: 'Plant detection not found' });
     }
-    res.json(detection);
+    
+    // Create a sanitized version without the full imageData to reduce response size
+    const sanitizedDetection = detection.toObject();
+    delete sanitizedDetection.imageData; // Remove the large base64 data
+    sanitizedDetection.imageUrl = `/api/images/${detection._id}`; // Add URL to access the image
+    
+    res.json(sanitizedDetection);
   } catch (error) {
     console.error('Error fetching detection:', error);
     res.status(500).json({ error: 'Failed to fetch plant detection' });
