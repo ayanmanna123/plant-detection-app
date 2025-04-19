@@ -1,0 +1,219 @@
+const express = require('express');
+const cors = require('cors');
+const multer = require('multer');
+const axios = require('axios');
+const fs = require('fs');
+const path = require('path');
+const mongoose = require('mongoose');
+require('dotenv').config();
+
+const app = express();
+const port = process.env.PORT || 5000;
+
+// Connect to MongoDB Atlas
+mongoose.connect(process.env.MONGODB_URI)
+  .then(() => console.log('Connected to MongoDB Atlas'))
+  .catch(err => console.error('MongoDB connection error:', err));
+
+// Define Plant Detection Schema
+const plantDetectionSchema = new mongoose.Schema({
+  originalImageName: String,
+  imagePath: String,
+  imageData: String, // Base64 encoded image
+  detectedAt: { type: Date, default: Date.now },
+  plantInfo: String,
+  scientificName: String,
+  commonName: String
+}, { timestamps: true });
+
+const PlantDetection = mongoose.model('PlantDetection', plantDetectionSchema);
+
+// Middleware
+app.use(cors());
+app.use(express.json({ limit: '50mb' }));
+app.use(express.static('public'));
+
+// Ensure public directory exists for serving images
+if (!fs.existsSync('public')) {
+  fs.mkdirSync('public');
+}
+if (!fs.existsSync('public/uploads')) {
+  fs.mkdirSync('public/uploads');
+}
+
+// Configure multer for file uploads
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    cb(null, 'public/uploads/');
+  },
+  filename: (req, file, cb) => {
+    const uniqueFilename = `${Date.now()}-${Math.round(Math.random() * 1E9)}${path.extname(file.originalname)}`;
+    cb(null, uniqueFilename);
+  }
+});
+
+const upload = multer({ 
+  storage: storage,
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB limit
+  fileFilter: (req, file, cb) => {
+    if (!file.mimetype.startsWith('image/')) {
+      return cb(new Error('Only image files are allowed'));
+    }
+    cb(null, true);
+  }
+});
+
+// Function to convert image to base64
+async function fileToBase64(filePath) {
+  const fileBuffer = await fs.promises.readFile(filePath);
+  return fileBuffer.toString('base64');
+}
+
+// Function to extract key information from plant data
+function extractPlantData(text) {
+  let scientificName = '';
+  let commonName = '';
+
+  // Simple regex to try to extract scientific and common names
+  const scientificMatch = text.match(/Scientific name.*?:\s*([A-Z][a-z]+ [a-z]+)/i);
+  if (scientificMatch && scientificMatch[1]) {
+    scientificName = scientificMatch[1];
+  }
+
+  const commonMatch = text.match(/Common name.*?:\s*([^\n]+)/i);
+  if (commonMatch && commonMatch[1]) {
+    commonName = commonMatch[1].trim();
+  }
+
+  return { scientificName, commonName };
+}
+
+// Plant detection endpoint
+app.post('/api/detect-plant', upload.single('image'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'No image file uploaded' });
+    }
+
+    const imagePath = req.file.path;
+    const mimeType = req.file.mimetype;
+    const originalImageName = req.file.originalname;
+    const imageUrl = `${req.protocol}://${req.get('host')}/${imagePath}`;
+    
+    // Convert image to base64 for Gemini API
+    const imageBase64 = await fileToBase64(imagePath);
+    
+    // Prepare payload for Gemini API
+    const payload = {
+      contents: [
+        {
+          parts: [
+            {
+              text: "Identify this plant. Please provide the following information: " +
+                    "1. Scientific name (Latin name) " +
+                    "2. Common name " +
+                    "3. Plant family " +
+                    "4. Brief description " +
+                    "5. Growing conditions " +
+                    "6. Care tips"
+            },
+            {
+              inline_data: {
+                mime_type: mimeType,
+                data: imageBase64
+              }
+            }
+          ]
+        }
+      ],
+      generation_config: {
+        temperature: 0.4,
+        max_output_tokens: 2048
+      }
+    };
+
+    // Make direct HTTP request to Gemini API
+    const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${process.env.GEMINI_API_KEY}`;
+    
+    const response = await axios.post(geminiUrl, payload, {
+      headers: {
+        'Content-Type': 'application/json'
+      }
+    });
+    
+    // Extract text from Gemini response
+    let plantInfo = '';
+    if (response.data && 
+        response.data.candidates && 
+        response.data.candidates[0] && 
+        response.data.candidates[0].content && 
+        response.data.candidates[0].content.parts) {
+      
+      // Combine all text parts from the response
+      plantInfo = response.data.candidates[0].content.parts
+        .filter(part => part.text)
+        .map(part => part.text)
+        .join('\n');
+    }
+    
+    // Extract key plant information
+    const { scientificName, commonName } = extractPlantData(plantInfo);
+
+    // Save to MongoDB with relative image path
+    const plantDetection = new PlantDetection({
+      originalImageName,
+      imagePath: req.file.path,
+      imageData: `data:${mimeType};base64,${imageBase64}`, // Store base64 image data
+      plantInfo,
+      scientificName,
+      commonName
+    });
+    
+    await plantDetection.save();
+    
+    res.json({ 
+      plantInfo,
+      id: plantDetection._id,
+      scientificName,
+      commonName,
+      imageUrl
+    });
+  } catch (error) {
+    console.error('Error detecting plant:', error.response?.data || error.message);
+    res.status(500).json({ 
+      error: error.response?.data?.error?.message || error.message || 'Failed to detect plant' 
+    });
+  }
+});
+
+// Get all plant detections
+app.get('/api/detections', async (req, res) => {
+  try {
+    const detections = await PlantDetection.find()
+      .sort({ detectedAt: -1 })
+      .select('originalImageName detectedAt scientificName commonName imageData _id');
+    
+    res.json(detections);
+  } catch (error) {
+    console.error('Error fetching detections:', error);
+    res.status(500).json({ error: 'Failed to fetch plant detections' });
+  }
+});
+
+// Get a specific plant detection by ID
+app.get('/api/detections/:id', async (req, res) => {
+  try {
+    const detection = await PlantDetection.findById(req.params.id);
+    if (!detection) {
+      return res.status(404).json({ error: 'Plant detection not found' });
+    }
+    res.json(detection);
+  } catch (error) {
+    console.error('Error fetching detection:', error);
+    res.status(500).json({ error: 'Failed to fetch plant detection' });
+  }
+});
+
+app.listen(port, () => {
+  console.log(`Server running on port ${port}`);
+});
